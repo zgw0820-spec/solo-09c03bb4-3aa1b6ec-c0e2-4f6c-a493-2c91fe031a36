@@ -23,6 +23,7 @@
 | 迟到旧传输不得回退 | `commit_version()` 拒绝任何 `serial <= active_serial` 的版本（返回 `ignored_stale`/False），事务保护 |
 | 任一方失败仍供原版 | 发布失败保留旧 active；同步失败保留旧 active；DNS 与 HTTP 在同一进程内独立运行 |
 | 主机发布无需等待备用 | 主机 API 不调用备用机；e2e 中备用停机时发布仍在毫秒级成功 |
+| 主机数据卷误删后从备用恢复 | `POST /api/recover`（`app/recovery.py` + `Storage.recover_empty_zone()`）：校验区域名与 A 记录，仅对空区恢复，新序号严格高于备用序号；竞争发布不被覆盖，失败保持原状并说明原因 |
 | Docker Compose 双服务 + Swagger | `docker-compose.yml` 起 primary/backup；`http://<host>:8080/docs`、`http://<host>:8081/docs` |
 
 ### 数据模型（SQLite，WAL 模式）
@@ -51,6 +52,39 @@ state(key TEXT PRIMARY KEY, value TEXT)
 - `GET  /api/zone` 当前完整区域（含 serial、records、published_at）
 - `POST /api/zone` **仅主机**，请求体 `{"records":[{"name":"db.internal.local","ip":"10.0.0.11"}]}`，成功返回 201 与新 serial
 - `POST /api/sync` **仅备用机**，立即拉取一次，返回 `synced` / `ignored_stale` / `failed`
+- `POST /api/recover` **仅主机**，灾备恢复：主机数据卷误删并重新初始化为空区（serial 0）后，
+  由运维触发，从备用机拉取当前完整区域并恢复为一个**序号严格高于备用机当前序号**的新版本；
+  成功 200 返回 `recovered` 与新旧序号；主机非空 409、备用不可达/数据无效 502、落库失败 500，
+  所有失败均保持主机原状态并在响应 `detail.reason` 中说明原因
+
+## 主机灾备恢复（POST /api/recover）
+
+适用场景：主机 SQLite 数据卷被误删，进程重启后 schema 重新初始化为空的种子版本
+（serial 0、0 条记录，UDP 对区域内名称返回 NXDOMAIN），而备用机仍持有最后一份
+可解析的完整区域。恢复流程：
+
+1. 运维对主机调用 `POST /api/recover`（无请求体）；
+2. 主机经 `BACKUP_API_URL` 拉取备用机 `GET /api/zone` 的完整区域；
+3. 校验**区域名**必须等于本机配置的固定区域（`DNS_ZONE`），并按发布同款规则校验
+   全部 **A 记录**（非空、≤8 条、仅 IPv4、名称在区域内、禁止重名）；
+4. 仅当主机**仍为空区**时，在单个 `BEGIN IMMEDIATE` 事务内复查空区、插入新版本并切换
+   active 指针；新序号 = `max(备用序号, 本机最大序号) + 1`，因此必然高于备用当前序号；
+5. 之后备用机按原有同步机制（手动 `/api/sync` 或后台循环）自动追平到恢复版本。
+
+并发与失败语义：
+
+| 情况 | HTTP | 主机状态 |
+| --- | --- | --- |
+| 恢复成功 | 200 `recovered` | 新版本生效，序号高于备用 |
+| 拉取期间发生正常发布 | 409 | 发布胜出，恢复放弃，新区域绝不被覆盖 |
+| 主机已有发布版本（serial>0） | 409 | 原样不变 |
+| 备用不可达 / HTTP 错误 / 坏报文 | 502 | 原样不变，reason 说明连接错误 |
+| 区域名不符 / A 记录非法 / 备用为空区 | 502 | 原样不变，reason 说明校验项 |
+| 落库事务失败 | 500 | 事务回滚，原样不变 |
+| 在备用机上调用 | 403 | 不变 |
+
+空区复查在事务内完成（`Storage.recover_empty_zone()`），与 `next_publish()`
+共用同一把锁和同一套事务隔离，因此恢复与发布的竞争只有一个赢家，不存在中间态。
 
 DNS 行为：区域内 A 查询命中返回 NOERROR+A；区域内不存在的名称 NXDOMAIN；
 区域内非 A 查询（如 AAAA）返回 NOERROR NODATA；区域外查询 REFUSED。
@@ -70,6 +104,9 @@ curl -sX POST http://localhost:8080/api/zone -H 'content-type: application/json'
 
 # 手动同步（后台也会每 3 秒自动同步）
 curl -sX POST http://localhost:8081/api/sync
+
+# 主机数据卷误删并重建为空区后，运维触发灾备恢复
+curl -sX POST http://localhost:8080/api/recover
 
 # UDP 查询
 dig @127.0.0.1 -p 5053 db.internal.local A
@@ -91,9 +128,10 @@ DNS_ROLE=backup  DB_PATH=./data/backup.db  DNS_PORT=15054 API_PORT=18001 \
 ## 测试
 
 ```bash
-.venv/bin/python -m pytest tests/test_unit.py -q     # 校验/事务/防回退单元测试
+.venv/bin/python -m pytest tests/test_unit.py -q     # 校验/事务/防回退/恢复单元测试
 .venv/bin/python -I tests/e2e_test.py                # 双进程端到端 30 项
 .venv/bin/python -I tests/auto_sync_test.py          # 自动同步/幂等/Swagger 8 项
+.venv/bin/python -I tests/recovery_test.py           # 主机恢复与并发发布 24 项
 ```
 
 端到端覆盖：启动空版本 NXDOMAIN、非法发布不升序号、发布后 UDP 应答、
@@ -109,6 +147,7 @@ DNS_ROLE=backup  DB_PATH=./data/backup.db  DNS_PORT=15054 API_PORT=18001 \
 | `DB_PATH` | `/data/dns.db` | 本机独立 SQLite 文件 |
 | `DNS_PORT` / `API_PORT` | `5053` / `8000` | UDP DNS / HTTP 端口 |
 | `PRIMARY_API_URL` | `http://primary:8000` | 备用机指向上机 API |
+| `BACKUP_API_URL` | `http://backup:8000` | 主机恢复时指向备用机 API（仅 `/api/recover` 使用） |
 | `SYNC_INTERVAL` | `5` | 备用机后台同步间隔秒 |
 | `HTTP_TIMEOUT` | `10` | 拉取区域 HTTP 超时秒 |
 | `MAX_RECORDS` | `8` | 单次区域最大 A 记录数 |

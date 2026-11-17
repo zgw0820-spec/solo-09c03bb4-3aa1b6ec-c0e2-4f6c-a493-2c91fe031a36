@@ -79,6 +79,46 @@ def test_failed_commit_leaves_old_version(storage):
     assert storage.storage.active_serial() == 1
 
 
+def test_recovery_restores_empty_primary_above_backup_serial(storage):
+    from app.storage import PrimaryNotEmpty
+
+    # Primary is the re-initialised empty seed zone (serial 0); the
+    # backup still holds the last published version serial 3.
+    assert storage.storage.active_serial() == 0
+    restored = [
+        rec("db.internal.local", "10.0.0.11"),
+        rec("web.internal.local", "10.0.0.21"),
+    ]
+    new_serial = storage.storage.recover_empty_zone(3, restored, "t-backup")
+    # The restored serial must be strictly higher than the backup's.
+    assert new_serial == 4
+    active, records, _ = storage.storage.get_active_version()
+    assert active == 4 and records == restored
+
+
+def test_recovery_refused_when_primary_already_published(storage):
+    from app.storage import PrimaryNotEmpty
+
+    storage.storage.next_publish([rec("new.internal.local", "10.0.0.7")])
+    before_serial = storage.storage.active_serial()
+    with pytest.raises(PrimaryNotEmpty):
+        storage.storage.recover_empty_zone(
+            5, [rec("old.internal.local", "10.9.9.9")], "t-backup"
+        )
+    # Nothing was overwritten: the racing publish keeps its version.
+    active, records, _ = storage.storage.get_active_version()
+    assert active == before_serial == 1
+    assert records == [rec("new.internal.local", "10.0.0.7")]
+
+
+def test_recovery_rejects_non_positive_backup_serial(storage):
+    with pytest.raises(ValueError):
+        storage.storage.recover_empty_zone(
+            0, [rec("a.internal.local", "10.0.0.1")], "t-bad"
+        )
+    assert storage.storage.active_serial() == 0
+
+
 def test_zone_validation_rules():
     from app.models import ZonePayload
 

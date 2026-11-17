@@ -22,6 +22,14 @@ _UTC = timezone.utc
 _init_lock = threading.Lock()
 
 
+class PrimaryNotEmpty(RuntimeError):
+    """Raised when recovery is attempted but the primary already has a zone.
+
+    The primary state is left untouched; the caller reports the conflict
+    instead of overwriting a zone produced by a normal publish.
+    """
+
+
 def utcnow_iso() -> str:
     return datetime.now(_UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
@@ -217,6 +225,70 @@ class Storage:
                 )
                 conn.execute("COMMIT")
                 return next_serial, published_at
+            except Exception:
+                conn.execute("ROLLBACK")
+                raise
+            finally:
+                conn.close()
+
+    def recover_empty_zone(
+        self,
+        backup_serial: int,
+        records: List[Dict[str, str]],
+        published_at: str,
+    ) -> int:
+        """Primary disaster recovery: restore an empty primary from the backup.
+
+        The primary must still be the seeded *empty* zone (serial 0, no
+        records) at commit time. The restored version gets a serial strictly
+        higher than the backup's current serial, so the backup can later
+        catch up through the normal synchronisation mechanism. The empty
+        check, the serial decision and the insert happen in one
+        ``BEGIN IMMEDIATE`` transaction: a publish racing a recovery either
+        wins first (recovery then raises ``PrimaryNotEmpty`` and changes
+        nothing) or waits for the recovery to commit (the publish itself
+        then produces the next serial). Nothing is ever overwritten.
+        """
+        if backup_serial < 1:
+            raise ValueError("backup serial must be a positive integer")
+        payload = json.dumps(records, separators=(",", ":"), sort_keys=True)
+        with self._lock:
+            conn = self._connect()
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                active = int(self._get_state(conn, "active_serial") or "0")
+                active_row = conn.execute(
+                    "SELECT record_count FROM zone_versions "
+                    "WHERE serial=?",
+                    (active,),
+                ).fetchone()
+                if active != 0 or (active_row and active_row["record_count"]):
+                    # A real publish happened while recovery was in flight;
+                    # the new zone must win, recovery must not overwrite it.
+                    conn.execute("ROLLBACK")
+                    raise PrimaryNotEmpty(
+                        f"primary is no longer an empty zone "
+                        f"(active serial={active})"
+                    )
+                max_row = conn.execute(
+                    "SELECT MAX(serial) AS s FROM zone_versions"
+                ).fetchone()
+                local_max = int(max_row["s"] or 0)
+                new_serial = max(backup_serial, local_max) + 1
+                conn.execute(
+                    "INSERT INTO zone_versions "
+                    "(serial, records_json, record_count, published_at) "
+                    "VALUES (?, ?, ?, ?)",
+                    (new_serial, payload, len(records), published_at),
+                )
+                conn.execute(
+                    "UPDATE state SET value=? WHERE key='active_serial'",
+                    (str(new_serial),),
+                )
+                conn.execute("COMMIT")
+                return new_serial
+            except PrimaryNotEmpty:
+                raise
             except Exception:
                 conn.execute("ROLLBACK")
                 raise

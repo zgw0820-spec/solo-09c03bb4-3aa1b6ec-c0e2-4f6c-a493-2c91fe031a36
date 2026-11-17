@@ -33,6 +33,9 @@ class Settings:
     db_path: str = _env("DB_PATH", "/data/dns.db")
     # Backup only: base URL of the primary HTTP API.
     primary_api_url: str = _env("PRIMARY_API_URL", "http://primary:8000")
+    # Primary only: base URL of the backup HTTP API, used by the
+    # operator-triggered recovery endpoint after a primary data loss.
+    backup_api_url: str = _env("BACKUP_API_URL", "http://backup:8000")
     # Backup background synchronisation interval (seconds).
     sync_interval: float = float(_env_int("SYNC_INTERVAL", 5))
     http_timeout: float = float(_env_int("HTTP_TIMEOUT", 10))

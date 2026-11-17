@@ -99,3 +99,12 @@ class PublishResult(BaseModel):
     serial: int
     record_count: int
     published_at: str
+
+
+class RecoveryResultOut(BaseModel):
+    status: str
+    serial: int
+    backup_serial: int
+    record_count: int
+    published_at: str
+    zone: str

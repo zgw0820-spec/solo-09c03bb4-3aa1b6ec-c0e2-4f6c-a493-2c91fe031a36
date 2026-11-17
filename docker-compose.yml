@@ -8,6 +8,8 @@ services:
       DB_PATH: /data/primary.db
       DNS_PORT: "5053"
       API_PORT: "8000"
+      # Used by POST /api/recover after a primary data-volume loss.
+      BACKUP_API_URL: http://backup:8000
     ports:
       - "8080:8000"      # primary Swagger / REST
       - "5053:5053/udp"  # primary DNS

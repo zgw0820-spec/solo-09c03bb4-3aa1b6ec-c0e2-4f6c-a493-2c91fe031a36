@@ -10,11 +10,13 @@ from .config import settings
 from .dns_server import dns_service
 from .models import (
     PublishResult,
+    RecoveryResultOut,
     RecordOut,
     VersionOut,
     ZoneOut,
     ZonePayload,
 )
+from .recovery import RecoveryError, recover_from_backup
 from .storage import storage
 
 logging.basicConfig(
@@ -126,6 +128,43 @@ def publish_zone(payload: ZonePayload) -> PublishResult:
         record_count=len(records),
         published_at=published_at,
     )
+
+
+@app.post(
+    "/api/recover",
+    response_model=RecoveryResultOut,
+    tags=["primary"],
+    responses={
+        403: {"description": "recovery is only available on the primary"},
+        409: {"description": "primary already has a published zone (no overwrite)"},
+        500: {"description": "restore transaction failed; primary state unchanged"},
+        502: {"description": "backup unreachable or returned an invalid zone"},
+    },
+)
+async def recover_primary() -> RecoveryResultOut:
+    """Disaster recovery after primary data loss.
+
+    Pulls the backup's current complete zone, validates the zone name and
+    every A record, and restores the primary only while it is still the
+    empty seed zone. The restored serial is strictly higher than the
+    backup's current serial, after which the backup catches up via the
+    normal sync. Any failure leaves the primary state untouched and the
+    response body explains the reason.
+    """
+    if not settings.is_primary:
+        raise HTTPException(
+            status_code=403,
+            detail="primary recovery is only allowed on the primary",
+        )
+    try:
+        result = await recover_from_backup()
+    except RecoveryError as exc:
+        log.warning("recovery failed: %s", exc.reason)
+        raise HTTPException(
+            status_code=exc.http_status,
+            detail={"status": "failed", "reason": exc.reason},
+        ) from exc
+    return RecoveryResultOut(**result.as_dict())
 
 
 # ----------------------------------------------------------------- backup
